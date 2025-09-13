@@ -1,0 +1,7 @@
+.env
+prompts/
+venv/
+node_modules/
+redacted/
+demo-footage/
+__pycache__/

@@ -1,0 +1,107 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+  relationMode = "prisma"
+}
+
+model User {
+  id           String  @id @default(cuid())
+  email        String  @unique
+  name         String
+  type         UserType
+  specialty    String? // Only for doctors
+  language     String
+  
+  // Relations
+  consultationsAsPatient Consultation[] @relation("PatientConsultations")
+  consultationsAsDoctor  Consultation[] @relation("DoctorConsultations")
+  messages               Message[]
+  prescriptions          Prescription[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Message {
+  id                 String @id @default(cuid())
+  translatedContent  String? @db.Text
+  translatedLanguage String?
+  originalLanguage   String?
+  originalContent    String? @db.Text
+  llm_language       String @default("en")
+  llm_content        String @db.Text
+  state              String? // Processing state message
+  
+  // Relations
+  senderId       String
+  sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  consultationId String
+  consultation   Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([consultationId])
+  @@index([senderId])
+}
+
+model Consultation {
+  id                        String            @id @default(cuid())
+  state                     ConsultationState
+  prescriptionAssistance    String? @db.Text
+  prescriptionAssistanceState String? @db.Text
+  
+  // Relations
+  patientId String
+  patient   User   @relation("PatientConsultations", fields: [patientId], references: [id], onDelete: Cascade)
+  doctorId  String?
+  doctor    User?  @relation("DoctorConsultations", fields: [doctorId], references: [id], onDelete: SetNull)
+  
+  messages      Message[]
+  prescriptions Prescription[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([state])
+}
+
+model Prescription {
+  id             String   @id @default(cuid())
+  drugName       String
+  frequency      String
+  startTimestamp DateTime
+  endTimestamp   DateTime
+  
+  // Relations
+  patientId      String
+  patient        User         @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  consultationId String
+  consultation   Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([patientId])
+  @@index([consultationId])
+}
+
+enum UserType {
+  PATIENT
+  DOCTOR
+  CLERK
+}
+
+enum ConsultationState {
+  CLERKING
+  CONSULTING
+}
