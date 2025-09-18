@@ -20,7 +20,7 @@ A single, clear query string optimized for searching the textbook for the most r
 
 """
 # <!-- B -->
-GRADER_PROMPT = """
+GRADE_PROMPT = """
 You are an expert document relevance evaluator. Your task is to determine if the retrieved documents contain information that directly addresses the given query.
  
 ## Instructions

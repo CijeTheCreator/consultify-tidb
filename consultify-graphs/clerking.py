@@ -3,25 +3,21 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt import tools_condition
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
-from typing import Literal
-from langgraph.graph import MessagesState
-from langchain.chat_models import init_chat_model
+from typing import Literal, cast
 from langchain_mistralai import ChatMistralAI
 from langchain_community.vectorstores import TiDBVectorStore
 from langchain_mistralai import MistralAIEmbeddings
 from dotenv import load_dotenv
 from langchain.tools.retriever import create_retriever_tool
-from models import AgentState
+from models import *
 from prompts import *
-
 load_dotenv()
 
 # Initialize the same embedding model you used before
 embeddings = MistralAIEmbeddings()
-response_model = ChatMistralAI()
+response_model = ChatMistralAI(model = "mistral-large-latest")
 
 # Connect to existing vector store
 tidb_connection_string = os.getenv("TIDB_CONN_STRING") or ""
@@ -44,60 +40,78 @@ retriever_tool = create_retriever_tool(
     "Search and return information about drugs",
 )
 
-response_model = ChatMistralAI()
+def format_conversation_history(conversation: list, consultation: Consultation) -> str:
+    """Format conversation history with participant roles (patient, clerk, doctor)."""
+    formatted_messages = []
+    
+    for message in conversation:
+        # Determine participant role based on sender_id
+        if message.sender_id == consultation.patient_id:
+            role = "patient"
+        elif message.sender_id == consultation.clerk_id:
+            role = "clerk"
+        elif message.sender_id == consultation.doctor_id:
+            role = "doctor"
+        else:
+            role = "unknown"
+        
+        # Use original_content instead of llm_content
+        content = message.original_content or message.llm_content
+        formatted_messages.append(f"{role}: {content}")
+    
+    return "\n".join(formatted_messages)
 
 def create_medical_lookup_query_or_respond(state: AgentState):
-    """Call the model to generate a response based on the current state. Given
-    the question, it will decide to retrieve using the retriever tool, or simply respond to the user.
-    """
-    response = (
-        response_model
-        .bind_tools([retriever_tool]).invoke(state["messages"])
-    )
-    return {"messages": [response]}
+    """Generate a query and then use it to retrieve medical information."""
+    
+    # Step 1: Check if refined_query is available, otherwise generate a new query
+    if state.refined_query:
+        # Use the refined query from the rewrite step
+        query_to_use = state.refined_query
+    else:
+        # Generate a new query using the query generation prompt
+        last_message = state.last_inserted_message_by_user
+        conversation_history = format_conversation_history(state.conversation, state.consultation)
+        
+        last_message_content = last_message.original_content or last_message.llm_content
+        query_prompt = GENERATE_QUERY_PROMPT.replace("<LastQuestion>", last_message_content).replace("</LastQuestion>", "").replace("<FullConversation>", conversation_history).replace("</FullConversation>", "")
+        
+        query_response = response_model.with_structured_output(QueryGeneration).invoke([
+            {"role": "user", "content": query_prompt}
+        ])
+        query_to_use = cast(QueryGeneration, query_response).query
+    
+    # Step 2: Use the query with the retriever tool
+    retrieval_response = retriever_tool.invoke(query_to_use)
+    
+    # Step 3: Update state with the query and retrieved context
+    return {
+        "query": query_to_use,
+        "context_retrieved": retrieval_response,
+        "messages": state.conversation + [state.last_inserted_message_by_user]
+    }
 
-GRADE_PROMPT = (
-    "You are a grader assessing relevance of a retrieved document to a user question. \n "
-    "Here is the retrieved document: \n\n {context} \n\n"
-    "Here is the user question: {question} \n"
-    "If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n"
-    "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."
-)
-
-class GradeDocuments(BaseModel):
-    """Grade documents using a binary score for relevance check."""
-    binary_score: str = Field(
-        description="Relevance score: 'yes' if relevant, or 'no' if not relevant"
-    )
-
-grader_model = ChatMistralAI()
 
 def grade_documents(
     state: AgentState,
 ) -> Literal["generate_response", "refine_search_query"]:
     """Determine whether the retrieved documents are relevant to the question."""
-    question = state["messages"][0].content
-    context = state["messages"][-1].content
-    prompt = GRADE_PROMPT.format(question=question, context=context)
-    response = (
-        grader_model
-        .with_structured_output(GradeDocuments).invoke(
-            [{"role": "user", "content": prompt}]
-        )
+    
+    prompt = GRADE_PROMPT.format(
+        query=state.query,
+        context_retrieved=state.context_retrieved
     )
-    score = response.binary_score
-    if score == "yes":
+    print(f"Prompt: {prompt}")
+    grade_response = response_model.with_structured_output(GradeDocuments).invoke([
+        {"role": "user", "content": prompt}
+    ])
+    
+    grade = cast(GradeDocuments, grade_response).binary_score
+    if grade == "YES":
         return "generate_response"
     else:
         return "refine_search_query"
 
-DOCTOR_SELECTION_PROMPT = """
-Your task is to determine if there has been enough data collected about the patient to select a doctor for his case. Conversations like this should typically take 2-3 exchanges before you route him to a doctor. Return yes if there is enough context to recommend a doctor for him, return no if there isn't enough context to recommend a doctor for him.
-Here is the conversation so far:
-<conversation>
-{conversation}
-</conversation>
-"""
 
 class DoctorSelection(BaseModel):
   """Determine if it is time to select a doctor based on the current state"""
@@ -111,7 +125,7 @@ def router(state: AgentState)-> Literal["create_medical_lookup_query_or_respond"
   conversation = state["messages"][0].content
   prompt = DOCTOR_SELECTION_PROMPT.format(conversation = conversation)
   response = (
-      grader_model
+      response_model
       .with_structured_output(DoctorSelection).invoke(
           [{"role": "user", "content": prompt}]
       ))
@@ -128,28 +142,21 @@ class RewrittenQuestion(BaseModel):
         description="The semantically improved and clarified version of the original question"
     )
 
-REWRITE_PROMPT = (
-    "Look at the input and try to reason about the underlying semantic intent / meaning.\n"
-    "Here is the initial question:"
-    "\n ------- \n"
-    "{question}"
-    "\n ------- \n"
-    "Formulate an improved question that captures the core intent more clearly and precisely."
-)
 
 def refine_search_query(state: AgentState):
     """Rewrite the original user question using structured output."""
-    messages = state["messages"]
-    question = messages[0]["content"]
-    prompt = REWRITE_PROMPT.format(question=question)
+    # Use the REWRITER_PROMPT which expects previous query and context
+    prompt = REWRITER_PROMPT.replace("<PreviousQuery>", state.query or "").replace("</PreviousQuery>", "").replace("<PreviousContextRetrieved>", state.context_retrieved or "").replace("</PreviousContextRetrieved>", "")
+    
     # Configure the model to use structured output with Pydantic
-    # This assumes you're using a model that supports structured output like OpenAI's GPT models
     response = response_model.with_structured_output(RewrittenQuestion).invoke([
         {"role": "user", "content": prompt}
     ])
-    # Extract just the improved question string
-    improved_question = response.improved_question
-    return {"messages": [{"role": "user", "content": improved_question}]}
+    improved_question = cast(RewrittenQuestion, response).improved_question
+    
+    # Store the improved question in refined_query field
+    print(f"Refined Query: {improved_question}")
+    return {"refined_query": improved_question}
 
 def generate_medical_consulatation_summary(state: AgentState):
   """Generate a medical consultation summary"""
@@ -171,15 +178,6 @@ def assign_doctor_to_consultation(state: AgentState):
   """Assign the doctor to the consultation"""
   return {"messages": [{"role": "user", "content": "Doctor assigned to consultation"}]}
 
-GENERATE_PROMPT = (
-    "You are an assistant for question-answering tasks. "
-    "Use the following pieces of retrieved context to answer the question. "
-    "If you don't know the answer, just say that you don't know. "
-    "Use three sentences maximum and keep the answer concise.\n"
-    "Question: {question} \n"
-    "Context: {context}"
-)
-
 def generate_response(state: AgentState):
     """Generate an answer."""
     question = state["messages"][0].content
@@ -188,7 +186,7 @@ def generate_response(state: AgentState):
     response = response_model.invoke([{"role": "user", "content": prompt}])
     return {"messages": [response]}
 
-workflow = StateGraph(MessagesState)
+workflow = StateGraph(AgentState)
 
 def translate_message(state: AgentState):
   """Determine the required medical specialty"""
@@ -235,5 +233,5 @@ workflow.add_edge("determine_required_medical_specialty", END)
 workflow.add_edge("refine_search_query", "create_medical_lookup_query_or_respond")
 
 # Compile
-graph = workflow.compile()
+# graph = workflow.compile()
 
