@@ -277,3 +277,29 @@ Based on the patient consultation and clinical evidence, extract specific prescr
 ## Output Format
 Return a structured list of prescriptions with drug_name, frequency, and duration for each recommended medication.
 """
+
+DOCTOR_SELECTION_PROMPT = """
+You are analyzing a patient-clerk conversation to determine if enough information has been gathered to select an appropriate doctor for the patient.
+
+## Conversation History
+{conversation}
+
+## Decision Criteria
+Doctor selection should occur when:
+- The patient has provided their main health concern or symptoms
+- At least 2-3 exchanges have occurred between patient and clerk
+- Basic symptom information (location, duration, severity, or nature) has been shared
+- The conversation has progressed beyond initial greetings
+
+Do NOT select a doctor if:
+- Only introductory messages have been exchanged
+- The patient hasn't described their health concern yet
+- Only 1 exchange has occurred
+- The conversation lacks sufficient medical context
+
+## Instructions
+Analyze the conversation and determine if sufficient information exists to make an informed doctor selection decision.
+
+## Output
+Respond with "yes" if enough information has been gathered to select a doctor, or "no" if more conversation is needed.
+"""

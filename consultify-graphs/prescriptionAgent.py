@@ -17,7 +17,7 @@ from langchain.tools.retriever import create_retriever_tool
 from langgraph.graph import StateGraph, START, END
 from models import *
 from prompts import *
-from helpers import format_conversation_history
+from helpers import format_conversation_history, update_prescription_assistance_state, add_prescription_assistance, create_prescription
 load_dotenv()
 
 
@@ -50,6 +50,10 @@ response_model = ChatMistralAI(model = "mistral-large-latest")
 
 def create_prescription_lookup_query(state: PrescriptionAgentState):
     """Generate a query and then use it to retrieve prescription information."""
+    
+    # Update state to inform user about current node activity
+    if state.consultation:
+        update_prescription_assistance_state(state.consultation.id, "Generating search query for drug information")
     
     # Step 1: Check if refined_query is available, otherwise generate a new query
     if state.refined_query:
@@ -90,11 +94,11 @@ def create_prescription_lookup_query(state: PrescriptionAgentState):
             {"role": "user", "content": query_prompt}
         ])
         query_to_use = query_response.query
-        print(f"Query Generated: {query_to_use}")
+        print(f"Query Generated")
     
     # Step 2: Use the query with the retriever tool
     retrieval_response = retriever_tool.invoke(query_to_use)
-    print(f"Retrieval: {retrieval_response}")
+    print(f"Retrieval")
     
     # Step 3: Update state with the query and retrieved context
     return {
@@ -112,7 +116,6 @@ def grade_documents(
         query=state.query,
         context_retrieved=state.context_retrieved
     )
-    print(f"Prompt: {prompt}")
     grade_response = response_model.with_structured_output(GradeDocuments).invoke([
         {"role": "user", "content": prompt}
     ])
@@ -126,6 +129,11 @@ def grade_documents(
 
 def refine_search_query(state: PrescriptionAgentState):
     """Rewrite the original user question using structured output."""
+    
+    # Update state to inform user about current node activity
+    if state.consultation:
+        update_prescription_assistance_state(state.consultation.id, "Refining search query for better drug information retrieval")
+    
     # Use the REWRITER_PROMPT which expects previous query and context
     prompt = REWRITER_PROMPT.replace("<PreviousQuery>", state.query or "").replace("</PreviousQuery>", "").replace("<PreviousContextRetrieved>", state.context_retrieved or "").replace("</PreviousContextRetrieved>", "")
     
@@ -136,12 +144,16 @@ def refine_search_query(state: PrescriptionAgentState):
     improved_question = cast(RewrittenQuestion, response).improved_question
     
     # Store the improved question in refined_query field
-    print(f"Refined Query: {improved_question}")
+    print(f"Refined Query")
     return {"refined_query": improved_question}
 
 
 def generate_response(state: PrescriptionAgentState):
     """Generate the prescription recommendation"""
+    
+    # Update state to inform user about current node activity
+    if state.consultation:
+        update_prescription_assistance_state(state.consultation.id, "Generating prescription recommendations")
     
     # Format conversation history using helper function
     if state.consultation:
@@ -166,7 +178,8 @@ def generate_response(state: PrescriptionAgentState):
     ])
     
     recommendations = cast(PrescriptionRecommendation, recommendation_response).recommendations
-    print(f"Generated Prescription Recommendations: {recommendations}")
+    print(f"Generated Prescription Recommendations")
+    print(recommendations)
     
     # Generate structured prescription data using a second LLM call
     structured_prompt = STRUCTURED_PRESCRIPTION_PROMPT.format(
@@ -174,7 +187,7 @@ def generate_response(state: PrescriptionAgentState):
         context_retrieved=state.context_retrieved or ""
     )
     
-    print(f"Structured Prescription Prompt: {structured_prompt}")
+    print(f"Structured Prescription Prompt")
     
     # Use structured output to get prescription data
     prescription_list_response = response_model.with_structured_output(PrescriptionList).invoke([
@@ -182,18 +195,71 @@ def generate_response(state: PrescriptionAgentState):
     ])
     
     prescription_data_list = cast(PrescriptionList, prescription_list_response).prescriptions
-    print(f"Generated Structured Prescriptions: {prescription_data_list}")
+    print(f"Generated Structured Prescriptions")
     
-    # Convert PrescriptionData to Prescription models
+    # Add prescription assistance to consultation
+    if state.consultation:
+        add_prescription_assistance(state.consultation.id, recommendations)
+        update_prescription_assistance_state(state.consultation.id, "Creating prescription records")
+    
+    # Convert PrescriptionData to Prescription models and create prescriptions
     prescription_models = []
     for prescription_data in prescription_data_list:
+        # Generate timestamps from duration
+        from datetime import datetime, timedelta
+        import re
+        
+        start_timestamp = datetime.now()
+        
+        # Parse duration and calculate end timestamp
+        duration_str = prescription_data.duration.lower()
+        
+        # Extract number and unit from duration
+        days = 0
+        if 'day' in duration_str:
+            match = re.search(r'(\d+)\s*days?', duration_str)
+            if match:
+                days = int(match.group(1))
+        elif 'week' in duration_str:
+            match = re.search(r'(\d+)\s*weeks?', duration_str)
+            if match:
+                days = int(match.group(1)) * 7
+        elif 'month' in duration_str:
+            match = re.search(r'(\d+)\s*months?', duration_str)
+            if match:
+                days = int(match.group(1)) * 30
+        elif 'ongoing' in duration_str or 'indefinite' in duration_str:
+            days = 365  # Default to 1 year for ongoing prescriptions
+        else:
+            days = 30  # Default to 30 days if can't parse
+        
+        end_timestamp = start_timestamp + timedelta(days=days)
+        
         prescription_model = Prescription(
             drug_name=prescription_data.drug_name,
             frequency=prescription_data.frequency,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
             patient_id=state.consultation.patient_id if state.consultation else None,
             consultation_id=state.consultation.id if state.consultation else None
         )
         prescription_models.append(prescription_model)
+        
+        # Create prescription record if consultation context is available
+        if state.consultation:
+            create_prescription(
+                drug_name=prescription_data.drug_name,
+                frequency=prescription_data.frequency,
+                start_timestamp=start_timestamp.isoformat(),
+                end_timestamp=end_timestamp.isoformat(),
+                patient_id=state.consultation.patient_id,
+                consultation_id=state.consultation.id
+            )
+    
+    # Final state update
+    if state.consultation:
+        update_prescription_assistance_state(state.consultation.id, "Prescription assistance completed")
+
     
     return {
         "prescriptions_recommended": prescription_models
@@ -203,27 +269,15 @@ workflow = StateGraph(PrescriptionAgentState)
 
 
 workflow.add_node(create_prescription_lookup_query)
-workflow.add_node("search_british_national_formulary", ToolNode([retriever_tool]))
 workflow.add_node(refine_search_query)
 workflow.add_node(generate_response)
 workflow.add_edge(
     START,
     "create_prescription_lookup_query"
 )
-# Decide whether to retrieve
+# Connect directly to grade_documents since we call the tool within the function
 workflow.add_conditional_edges(
     "create_prescription_lookup_query",
-    # Assess LLM decision (call `retriever_tool` tool or respond to the user)
-    tools_condition,
-    {
-        # Translate the condition outputs to nodes in our graph
-        "tools": "search_british_national_formulary",
-        END: END,
-    },
-)
-# Edges taken after the `action` node is called.
-workflow.add_conditional_edges(
-    "search_british_national_formulary",
     # Assess agent decision
     grade_documents,
 )

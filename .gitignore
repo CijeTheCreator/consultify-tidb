@@ -1,3 +1,5 @@
 .env
+prompts/
 venv/
 node_modules/
+redacted/

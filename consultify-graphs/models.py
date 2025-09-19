@@ -71,6 +71,7 @@ class AgentState(BaseModel):
     doctor: Optional[Doctor] = Field(default=None, description="Selected doctor for the consultation")
     doctor_selection_rationale: Optional[str] = Field(default=None, description="Context retrieved from tidb vector store")
     medical_consultation_summary: Optional[str] = Field(default=None, description="Context retrieved from tidb vector store")
+    messages: Optional[list] = Field(default=[], description="Messages for LangGraph tools condition")
 
 
 class PrescriptionAgentState(BaseModel):

@@ -240,3 +240,87 @@ def create_user(
     response = requests.post(url, json=payload)
     response.raise_for_status()
     return response.json()
+
+
+
+def add_prescription_assistance(
+    consultation_id: str,
+    prescription_assistance: str
+) -> Dict[str, Any]:
+    """
+    Add prescription assistance to a consultation.
+
+    Args:
+        consultation_id: ID of the consultation
+        prescription_assistance: Prescription assistance content
+
+    Returns:
+        Dict containing the updated consultation
+    """
+    url = f"{get_base_url()}/consultations/{consultation_id}/prescription-assistance"
+    
+    payload = {"prescriptionAssistance": prescription_assistance}
+    
+    response = requests.post(url, json=payload)
+    response.raise_for_status()
+    return response.json()
+
+def update_prescription_assistance_state(
+    consultation_id: str,
+    prescription_assistance_state: str
+) -> Dict[str, Any]:
+    """
+    Update the prescription assistance state of a consultation.
+
+    Args:
+        consultation_id: ID of the consultation
+        prescription_assistance_state: New prescription assistance state
+
+    Returns:
+        Dict containing the updated consultation
+    """
+    url = f"{get_base_url()}/consultations/{consultation_id}/prescription-assistance-state"
+    
+    payload = {"prescriptionAssistanceState": prescription_assistance_state}
+    
+    response = requests.put(url, json=payload)
+    response.raise_for_status()
+    return response.json()
+
+
+def create_prescription(
+    drug_name: str,
+    frequency: str,
+    start_timestamp: str,
+    end_timestamp: str,
+    patient_id: str,
+    consultation_id: str
+) -> Dict[str, Any]:
+    """
+    Create a new prescription.
+
+    Args:
+        drug_name: Name of the drug
+        frequency: Frequency of medication
+        start_timestamp: Start date/time for prescription
+        end_timestamp: End date/time for prescription
+        patient_id: ID of the patient
+        consultation_id: ID of the consultation
+
+    Returns:
+        Dict containing the created prescription
+    """
+    url = f"{get_base_url()}/prescriptions"
+    
+    payload = {
+        "drugName": drug_name,
+        "frequency": frequency,
+        "startTimestamp": start_timestamp,
+        "endTimestamp": end_timestamp,
+        "patientId": patient_id,
+        "consultationId": consultation_id
+    }
+    
+    response = requests.post(url, json=payload)
+    response.raise_for_status()
+    return response.json()

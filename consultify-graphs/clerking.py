@@ -1,6 +1,7 @@
 import os
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START, END, message
 from langgraph.prebuilt import ToolNode
+from models import Message
 from langgraph.prebuilt import tools_condition
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
@@ -26,7 +27,7 @@ tidb_connection_string = os.getenv("TIDB_CONN_STRING") or ""
 vector_store = TiDBVectorStore(
     connection_string=tidb_connection_string,
     embedding_function=embeddings,
-    table_name="british-formulary",  # Your existing table name
+    table_name="microbiology_pharmacology_immunology_textbookV2",  # Your existing table name
     distance_strategy="cosine"
 )
 
@@ -38,13 +39,49 @@ retriever = vector_store.as_retriever(
 
 retriever_tool = create_retriever_tool(
     retriever,
-    "retrieve_info_on_drugs",
-    "Search and return information about drugs",
+    "retrieve_info_on_symptoms",
+    "Search on return information about symptoms",
 )
 
 
 def create_medical_lookup_query_or_respond(state: AgentState):
     """Generate a query and then use it to retrieve medical information."""
+    
+    # Create message if it doesn't exist
+    if not state.next_message_to_append or not state.next_message_to_append.id:
+        clerk_sender_id = os.getenv("CLERK_SENDER_ID")
+        if clerk_sender_id and state.consultation:
+            routing_message = create_message(
+                sender_id=clerk_sender_id,
+                consultation_id=state.consultation.id,
+                original_content="",
+                original_language="",
+                translated_content="",
+                translated_language="",
+                llm_content="",
+                llm_language="en",
+                state="Generating medical query"
+            )
+            print(f"New message is {routing_message}")
+            # Update state with the new message
+            next_message_to_append = Message(
+                id=routing_message.get('id'),
+                sender_id=clerk_sender_id,
+                consultation_id=state.consultation.id,
+                original_content=routing_message.get('original_content', ""),
+                original_language=routing_message.get('original_language', ""),
+                translated_content=routing_message.get('translated_content', ""),
+                translated_language=routing_message.get('translated_language', ""),
+                llm_content=routing_message.get('llm_content', ""),
+                llm_language=routing_message.get('llm_language', "en")
+            )
+    else:
+        # Update message state to show we're generating query
+        print("Generating Medical Query")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Generating medical query"
+        )
     
     # Step 1: Check if refined_query is available, otherwise generate a new query
     if state.refined_query:
@@ -63,14 +100,31 @@ def create_medical_lookup_query_or_respond(state: AgentState):
         ])
         query_to_use = cast(QueryGeneration, query_response).query
     
+    # Update message state to show we're retrieving information
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Retrieving medical information")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Retrieving medical information"
+        )
+    
     # Step 2: Use the query with the retriever tool
     retrieval_response = retriever_tool.invoke(query_to_use)
+    
+    # Update message state to show retrieval completed
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Information retrieved")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Information retrieved"
+        )
     
     # Step 3: Update state with the query and retrieved context
     return {
         "query": query_to_use,
         "context_retrieved": retrieval_response,
-        "messages": state.conversation + [state.last_inserted_message_by_user]
+        "conversation": state.conversation + [state.last_inserted_message_by_user],
+        "next_message_to_append": next_message_to_append
     }
 
 
@@ -78,6 +132,14 @@ def grade_documents(
     state: AgentState,
 ) -> Literal["generate_response", "refine_search_query"]:
     """Determine whether the retrieved documents are relevant to the question."""
+    
+    # Update message state to show we're grading documents
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Evaluating retrieved information")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Evaluating retrieved information"
+        )
     
     prompt = GRADE_PROMPT.format(
         query=state.query,
@@ -89,6 +151,22 @@ def grade_documents(
     ])
     
     grade = cast(GradeDocuments, grade_response).binary_score
+    
+    # Update message state based on grade result
+    if state.next_message_to_append and state.next_message_to_append.id:
+        if grade == "YES":
+            print("Information verified - generating response")
+            add_message(
+                message_id=state.next_message_to_append.id,
+                state="Information verified - generating response"
+            )
+        else:
+            print("Refining search query")
+            add_message(
+                message_id=state.next_message_to_append.id,
+                state="Refining search query"
+            )
+    
     if grade == "YES":
         return "generate_response"
     else:
@@ -102,19 +180,31 @@ class DoctorSelection(BaseModel):
 
 def router(state: AgentState)-> Literal["create_medical_lookup_query_or_respond", "determine_required_medical_specialty", "translate_message"]:
   """Determine if it is time to select a doctor, respond to a user or translate a message based on the current state"""
-  if 1<3: #Replace with consulation state check here
+  
+  # If consultation is already in CONSULTING state, translate the message
+  if state.consultation.state == "CONSULTING": 
         return "translate_message"
-  conversation = state["messages"][0].content
-  prompt = DOCTOR_SELECTION_PROMPT.format(conversation = conversation)
+  
+  # Format conversation history for analysis
+  conversation = format_conversation_history(state.conversation, state.consultation)
+  
+  # Use the doctor selection prompt to determine if enough info has been gathered
+  prompt = DOCTOR_SELECTION_PROMPT.format(conversation=conversation)
   response = (
       response_model
       .with_structured_output(DoctorSelection).invoke(
           [{"role": "user", "content": prompt}]
       ))
+  
+  # Check the binary answer from the LLM
   score = response.binary_answer
+  
+  # Route based on whether enough information has been gathered
   if score == "yes":
+    # Enough information gathered - proceed to doctor selection
     return "determine_required_medical_specialty"
   else:
+    # Need more information - continue conversation with medical lookup/response
     return "create_medical_lookup_query_or_respond"
 
 
@@ -127,6 +217,15 @@ class RewrittenQuestion(BaseModel):
 
 def refine_search_query(state: AgentState):
     """Rewrite the original user question using structured output."""
+    
+    # Update message state to show we're refining the query
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Refining search query")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Refining search query"
+        )
+    
     # Use the REWRITER_PROMPT which expects previous query and context
     prompt = REWRITER_PROMPT.replace("<PreviousQuery>", state.query or "").replace("</PreviousQuery>", "").replace("<PreviousContextRetrieved>", state.context_retrieved or "").replace("</PreviousContextRetrieved>", "")
     
@@ -135,6 +234,14 @@ def refine_search_query(state: AgentState):
         {"role": "user", "content": prompt}
     ])
     improved_question = cast(RewrittenQuestion, response).improved_question
+    
+    # Update message state to show query has been refined
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Search query refined")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Search query refined"
+        )
     
     # Store the improved question in refined_query field
     print(f"Refined Query: {improved_question}")
@@ -146,6 +253,43 @@ def generate_medical_consulatation_summary(state: AgentState):
 
 def determine_required_medical_specialty(state: AgentState):
     """Determine the required medical specialty"""
+    
+    # Create message if it doesn't exist
+    if not state.next_message_to_append or not state.next_message_to_append.id:
+        clerk_sender_id = os.getenv("CLERK_SENDER_ID")
+        if clerk_sender_id and state.consultation:
+            routing_message = create_message(
+                sender_id=clerk_sender_id,
+                consultation_id=state.consultation.id,
+                original_content="",
+                original_language="",
+                translated_content="",
+                translated_language="",
+                llm_content="",
+                llm_language="en",
+                state="Determining required medical specialty"
+            )
+            # Update state with the new message
+            from models import Message
+            state.next_message_to_append = Message(
+                id=routing_message.get('id'),
+                sender_id=clerk_sender_id,
+                consultation_id=state.consultation.id,
+                original_content="",
+                original_language="",
+                translated_content="",
+                translated_language="",
+                llm_content="",
+                llm_language="en"
+            )
+    else:
+        # Update message state to show we're determining specialty
+        print("Determining required medical specialty")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Determining required medical specialty"
+        )
+    
     # Format conversation history
     conversation_history = format_conversation_history(state.conversation, state.consultation)
     
@@ -166,11 +310,27 @@ def determine_required_medical_specialty(state: AgentState):
     selected_specialty = cast(MedicalSpecialty, specialty_response).specialty
     print(f"Specialty selected is {selected_specialty}")
     
+    # Update message state to show specialty determined
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print(f"Specialty determined: {selected_specialty}")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state=f"Specialty determined: {selected_specialty}"
+        )
+    
     return {"medical_specialty": selected_specialty}
 
 def find_matching_doctor(state: AgentState):
     """Find a matching doctor based on medical specialty with fallback strategy"""
     specialty = state.medical_specialty
+    
+    # Update message state to show we're finding a doctor
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print(f"Finding doctor with specialty: {specialty}")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state=f"Finding doctor with specialty: {specialty}"
+        )
     
     # First, try to find doctors with the specific specialty
     doctors = get_doctors_by_specialty(specialty)
@@ -178,11 +338,23 @@ def find_matching_doctor(state: AgentState):
     # If no doctors found with specific specialty, try "General Medicine"
     if not doctors:
         print(f"No doctors found for specialty '{specialty}', trying 'General Medicine'")
+        if state.next_message_to_append and state.next_message_to_append.id:
+            print(f"Finding general medicine doctor")
+            add_message(
+                message_id=state.next_message_to_append.id,
+                state="Finding general medicine doctor"
+            )
         doctors = get_doctors_by_specialty("General Medicine")
     
     # If still no doctors found, get all doctors
     if not doctors:
         print("No doctors found for 'General Medicine', getting all doctors")
+        if state.next_message_to_append and state.next_message_to_append.id:
+            print(f"Finding any available doctor")
+            add_message(
+                message_id=state.next_message_to_append.id,
+                state="Finding any available doctor"
+            )
         doctors = get_doctors_by_specialty()
     
     # If we still have no doctors, raise an error
@@ -201,10 +373,27 @@ def find_matching_doctor(state: AgentState):
     
     print(f"Selected doctor: {selected_doctor.id} with specialty: {selected_doctor.specialty}")
     
+    # Update message state to show doctor found
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print(f"Doctor found: {selected_doctor.specialty} specialist")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state=f"Doctor found: {selected_doctor.specialty} specialist"
+        )
+    
     return {"doctor": selected_doctor}
 
 def create_doctor_selection_rationale(state: AgentState):
     """Create a doctor selection rationale"""
+    
+    # Update message state to show we're creating rationale
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Creating doctor selection rationale")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Creating doctor selection rationale"
+        )
+    
     # Format conversation history
     conversation_history = format_conversation_history(state.conversation, state.consultation)
     
@@ -234,10 +423,26 @@ def create_doctor_selection_rationale(state: AgentState):
     generated_rationale = cast(DoctorSelectionRationale, rationale_response).rationale
     print(f"Doctor Selection Rationale: {generated_rationale}")
     
+    # Update message state to show rationale created
+    if state.next_message_to_append and state.next_message_to_append.id:
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Doctor selection rationale created"
+        )
+    
     return {"doctor_selection_rationale": generated_rationale}
 
 def assign_doctor_to_consultation(state: AgentState):
     """Assign the doctor to the consultation"""
+    
+    # Update message state to show we're assigning doctor
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Assigning doctor to consultation")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Assigning doctor to consultation"
+        )
+    
     # Get sender ID from environment variable
     clerk_sender_id = os.getenv("CLERK_SENDER_ID")
     if not clerk_sender_id:
@@ -247,6 +452,11 @@ def assign_doctor_to_consultation(state: AgentState):
     rationale_text = state.doctor_selection_rationale
     if not rationale_text:
         raise ValueError("No doctor_selection_rationale found in state")
+
+
+    message_id = state.next_message_to_append.id
+    if not message_id:
+        raise ValueError("No message id for next message")
     
     # Determine original language
     original_language = (
@@ -256,7 +466,8 @@ def assign_doctor_to_consultation(state: AgentState):
     )
     
     # Create message using create_message function
-    create_message(
+    add_message(
+        message_id=message_id,
         sender_id=clerk_sender_id,
         consultation_id=state.consultation.id,
         original_content=rationale_text,
@@ -273,9 +484,26 @@ def assign_doctor_to_consultation(state: AgentState):
         doctor_id=state.doctor.id
     )
     print("Doctor Assigned")
+    
+    # Update message state to show doctor assigned
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Doctor successfully assigned")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Doctor successfully assigned"
+        )
 
 def generate_response(state: AgentState):
     """Generate an answer."""
+    
+    # Update message state to show we're generating response
+    if state.next_message_to_append and state.next_message_to_append.id:
+        print("Generating response")
+        add_message(
+            message_id=state.next_message_to_append.id,
+            state="Generating response"
+        )
+    
     # Format conversation history
     conversation_history = format_conversation_history(state.conversation, state.consultation)
     
@@ -320,7 +548,8 @@ def generate_response(state: AgentState):
         translated_content=generated_content,
         translated_language=original_language,
         llm_content=generated_content,
-        llm_language=original_language
+        llm_language=original_language,
+        state="Response generated"
     )
     print("Message sent")
     
@@ -342,41 +571,56 @@ def translate_message(state: AgentState):
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
     
-    # Get the message to translate
-    if not state.next_message_to_append or not state.next_message_to_append.original_content:
-        raise ValueError("No message to translate found in next_message_to_append")
+    # Get the message to translate from last_inserted_message_by_user
+    if not state.last_inserted_message_by_user or not state.last_inserted_message_by_user.original_content:
+        raise ValueError("No message to translate found in last_inserted_message_by_user")
     
-    original_content = state.next_message_to_append.original_content
-    sender_id = state.next_message_to_append.sender_id
+    original_content = state.last_inserted_message_by_user.original_content
+    sender_id = state.last_inserted_message_by_user.sender_id
     
-    # Update the existing message state to "Translating"
-    if state.next_message_to_append.id:
-        add_message(
-            message_id=state.next_message_to_append.id,
-            state="Translating"
-        )
-    else:
-        # Create message with "Translating" state first if no ID exists
-        created_message = create_message(
-            sender_id=sender_id,
-            consultation_id=state.consultation.id,
-            original_content=original_content,
-            original_language=state.next_message_to_append.original_language or "en",
-            state="Translating"
-        )
-        state.next_message_to_append.id = created_message.get('id')
+    # Create message first with "Translating" state
+    created_message = create_message(
+        sender_id=sender_id,
+        consultation_id=state.consultation.id,
+        original_content=original_content,
+        original_language=state.last_inserted_message_by_user.original_language or "en",
+        state="Translating"
+    )
+    
+    # Create new Message object for next_message_to_append
+    from models import Message
+    next_message_to_append = Message(
+        id=created_message.get('id'),
+        sender_id=sender_id,
+        consultation_id=state.consultation.id,
+        original_content=original_content,
+        original_language=state.last_inserted_message_by_user.original_language or "en",
+        translated_content="",
+        translated_language="",
+        llm_content="",
+        llm_language=""
+    )
+    
+    print("Translating")
     
     # Determine target languages
     target_language = "en"  # Default to English
     llm_language = "en"     # LLM always processes in English
     
     # If doctor is assigned, use doctor's language as target language
-    if state.consultation.doctor_id and hasattr(state, 'doctor') and state.doctor and state.doctor.language:
+    if hasattr(state, 'doctor') and state.doctor and state.doctor.language:
         target_language = state.doctor.language
+    
+    # Update message state to show language determination
+    print(f"Translating to {target_language}")
+    add_message(
+        message_id=next_message_to_append.id,
+        state=f"Translating to {target_language}"
+    )
     
     def translate_to_language(content: str, language: str) -> str:
         """Translate content to specified language"""
-        if language == state.next_message_to_append.original_language:
+        if language == next_message_to_append.original_language:
             return content  # No translation needed if same language
             
         prompt = TRANLSATION_PROMPT.replace("[TARGET_LANGUAGE]", language).replace("[MESSAGE_CONTENT]", content)
@@ -393,6 +637,13 @@ def translate_message(state: AgentState):
         llm_content = translated_content
     else:
         # Different languages, translate in parallel
+        # Update message state to show parallel translation
+        print("Performing parallel translations")
+        add_message(
+            message_id=next_message_to_append.id,
+            state="Performing parallel translations"
+        )
+        
         with ThreadPoolExecutor(max_workers=2) as executor:
             target_future = executor.submit(translate_to_language, original_content, target_language)
             llm_future = executor.submit(translate_to_language, original_content, llm_language)
@@ -400,15 +651,17 @@ def translate_message(state: AgentState):
             translated_content = target_future.result()
             llm_content = llm_future.result()
     
-    # Update the message object in state
-    state.next_message_to_append.translated_content = translated_content
-    state.next_message_to_append.translated_language = target_language
-    state.next_message_to_append.llm_content = llm_content
-    state.next_message_to_append.llm_language = llm_language
+    # Update the message object
+    next_message_to_append.translated_content = translated_content
+    next_message_to_append.translated_language = target_language
+    next_message_to_append.llm_content = llm_content
+    next_message_to_append.llm_language = llm_language
     
-    # Add message with translations (this updates the existing message)
+    # Add translations to the original message using add_message
+    print("Translated")
+    print(f"Translated Message: {translated_content}")
     add_message(
-        message_id=state.next_message_to_append.id,
+        message_id=next_message_to_append.id,
         translated_content=translated_content,
         translated_language=target_language,
         llm_content=llm_content,
@@ -416,7 +669,7 @@ def translate_message(state: AgentState):
         state="Translated"
     )
     
-    return {"next_message_to_append": state.next_message_to_append}
+    return {"next_message_to_append": next_message_to_append}
 
 # Define the nodes we will cycle between
 workflow.add_node(translate_message)
@@ -437,17 +690,8 @@ workflow.add_edge("determine_required_medical_specialty", "find_matching_doctor"
 workflow.add_edge("find_matching_doctor", "create_doctor_selection_rationale")
 workflow.add_edge("create_doctor_selection_rationale", "generate_medical_consulatation_summary")
 workflow.add_edge("generate_medical_consulatation_summary", "assign_doctor_to_consultation")
-# Decide whether to retrieve
-workflow.add_conditional_edges(
-    "create_medical_lookup_query_or_respond",
-    # Assess LLM decision (call `retriever_tool` tool or respond to the user)
-    tools_condition,
-    {
-        # Translate the condition outputs to nodes in our graph
-        "tools": "search_mpi_textbook",
-        END: END,
-    },
-)
+# Connect directly to generate_response since we call the tool within the function
+workflow.add_edge("create_medical_lookup_query_or_respond", "generate_response")
 # Edges taken after the `action` node is called.
 workflow.add_conditional_edges(
     "search_mpi_textbook",
