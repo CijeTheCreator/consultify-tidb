@@ -2,6 +2,7 @@ import os
 import requests
 from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
+from models import Consultation
 
 # Load environment variables
 load_dotenv()
@@ -62,6 +63,27 @@ def create_message(
     response = requests.post(url, json=payload)
     response.raise_for_status()
     return response.json()
+
+def format_conversation_history(conversation: list, consultation: Consultation) -> str:
+    """Format conversation history with participant roles (patient, clerk, doctor)."""
+    formatted_messages = []
+    
+    for message in conversation:
+        # Determine participant role based on sender_id
+        if message.sender_id == consultation.patient_id:
+            role = "patient"
+        elif message.sender_id == consultation.clerk_id:
+            role = "clerk"
+        elif message.sender_id == consultation.doctor_id:
+            role = "doctor"
+        else:
+            role = "unknown"
+        
+        # Use original_content instead of llm_content
+        content = message.original_content or message.llm_content
+        formatted_messages.append(f"{role}: {content}")
+    
+    return "\n".join(formatted_messages)
 
 def add_message(
     message_id: str,

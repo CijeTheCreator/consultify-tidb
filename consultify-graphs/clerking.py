@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from langchain.tools.retriever import create_retriever_tool
 from models import *
 from prompts import *
-from helpers import add_message, get_doctors_by_specialty, create_message, assign_doctor
+from helpers import add_message, get_doctors_by_specialty, create_message, assign_doctor, format_conversation_history
 import random
 load_dotenv()
 
@@ -42,26 +42,6 @@ retriever_tool = create_retriever_tool(
     "Search and return information about drugs",
 )
 
-def format_conversation_history(conversation: list, consultation: Consultation) -> str:
-    """Format conversation history with participant roles (patient, clerk, doctor)."""
-    formatted_messages = []
-    
-    for message in conversation:
-        # Determine participant role based on sender_id
-        if message.sender_id == consultation.patient_id:
-            role = "patient"
-        elif message.sender_id == consultation.clerk_id:
-            role = "clerk"
-        elif message.sender_id == consultation.doctor_id:
-            role = "doctor"
-        else:
-            role = "unknown"
-        
-        # Use original_content instead of llm_content
-        content = message.original_content or message.llm_content
-        formatted_messages.append(f"{role}: {content}")
-    
-    return "\n".join(formatted_messages)
 
 def create_medical_lookup_query_or_respond(state: AgentState):
     """Generate a query and then use it to retrieve medical information."""
@@ -479,5 +459,5 @@ workflow.add_edge("determine_required_medical_specialty", END)
 workflow.add_edge("refine_search_query", "create_medical_lookup_query_or_respond")
 
 # Compile
-# graph = workflow.compile()
+graph = workflow.compile()
 
